@@ -1,0 +1,99 @@
+name: dsh
+
+# Trigger surface:
+#   - a repository owner / member / collaborator comments "/dsh <task>" on an issue
+#   - manual dispatch, for testing
+#
+# Deliberately NOT triggered by: issues opened by strangers, pull_request_target,
+# or any event where the workflow file could come from an unreviewed branch.
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      task:
+        description: Task text to hand to dsh
+        required: true
+        type: string
+
+# Least privilege. Everything not listed is "none".
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# One run per issue at a time; never cancel a run that is mid-push.
+concurrency:
+  group: dsh-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # A comment only counts when (a) it is on a plain issue, (b) it starts with
+    # the /dsh command, and (c) the author is trusted. Anyone can open an issue,
+    # so (c) is the important one.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request == null &&
+       startsWith(github.event.comment.body, '/dsh') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Pin the version: the npm "latest" dist-tag for this package is stale.
+      - name: Install dsh
+        run: npm install --global @deepseek-ai/dsh@0.2.1-rc.3
+
+      - name: Run dsh headless
+        # Everything the prompt needs arrives through env, never by interpolating
+        # event fields straight into the shell (that would be a script-injection hole).
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          DISPATCH_TASK: ${{ inputs.task }}
+        run: bash scripts/run-dsh.sh
+
+      - name: Post reply
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ISSUE_NUMBER:-}" ]; then
+            echo "not an issue event; nothing to reply to"
+            exit 0
+          fi
+          if [ ! -s /tmp/dsh-reply.md ]; then
+            printf '_dsh produced no output._\n' > /tmp/dsh-reply.md
+          fi
+          {
+            printf '🤖 **dsh**\n\n'
+            cat /tmp/dsh-reply.md
+            printf '\n\n<sub><a href="%s/%s/actions/runs/%s">run log</a></sub>\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          } > /tmp/dsh-post.md
+          gh issue comment "$ISSUE_NUMBER" --body-file /tmp/dsh-post.md
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-log-${{ github.run_id }}
+          path: /tmp/dsh.log
+          if-no-files-found: ignore
+          retention-days: 7
