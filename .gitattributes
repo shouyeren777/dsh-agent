@@ -1,0 +1,2 @@
+# Keep shell scripts LF on every platform: a CRLF checkout breaks bash on the runner.
+*.sh text eol=lf
